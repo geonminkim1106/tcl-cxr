@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
+from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, precision_score, recall_score
 from PIL import Image
 import timm
 
@@ -89,6 +89,46 @@ def evaluate_model(model, val_loader, criterion, device):
     auroc = roc_auc_score(all_labels, all_probs)
     f1 = f1_score(all_labels, all_preds)
     return {'AUROC': auroc, 'F1': f1}
+
+def analyze_confusion_matrix(model, val_loader, device, threshold=0.5, model_name="Model"):
+    """
+    Evaluates the model on validation data and prints TP, TN, FP, FN, Precision, and Recall.
+    """
+    model.eval()
+    all_labels, all_preds = [], []
+    
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            # Ensure output shape is compatible
+            outputs = model(images)
+            if outputs.dim() > 1:
+                outputs = outputs.squeeze(-1)
+                
+            probs = torch.sigmoid(outputs)
+            preds = (probs > threshold).float()
+            
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            
+    # Calculate components of the confusion matrix
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
+    
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0) # Sensitivity
+    
+    predicted_positive_ratio = (tp + fp) / len(all_labels)
+    
+    print(f"=== {model_name} (Threshold: {threshold}) ===")
+    print(f"Total Validation Samples: {len(all_labels)}")
+    print(f"TP (True Positive - Hit)      : {tp}")
+    print(f"FN (False Negative - Missed TB): {fn}")
+    print(f"TN (True Negative - Correct Normal) : {tn}")
+    print(f"FP (False Positive - False Alarm)   : {fp}")
+    print(f"--------------------------------------")
+    print(f"Precision            : {precision:.4f}")
+    print(f"Recall (Sensitivity) : {recall:.4f}")
+    print(f"Predicted Pos. Ratio : {predicted_positive_ratio:.4f}\n")
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
