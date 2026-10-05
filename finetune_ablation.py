@@ -50,7 +50,10 @@ class TBClassifier(nn.Module):
     """Downstream Classifier utilizing the pretrained Xception backbone."""
     def __init__(self, pretrained_model_path=None):
         super(TBClassifier, self).__init__()
-        self.backbone = timm.create_model('xception', pretrained=False, num_classes=0)
+        
+        # Load standard ImageNet weights if no pretrained_model_path is provided
+        use_imagenet = pretrained_model_path is None
+        self.backbone = timm.create_model('xception', pretrained=use_imagenet, num_classes=0)
         
         # Inject self-supervised weights if provided
         if pretrained_model_path and os.path.exists(pretrained_model_path):
@@ -87,7 +90,7 @@ def evaluate_model(model, val_loader, criterion, device):
             all_probs.extend(probs.cpu().numpy())
 
     auroc = roc_auc_score(all_labels, all_probs)
-    f1 = f1_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
     return {'AUROC': auroc, 'F1': f1}
 
 def analyze_confusion_matrix(model, val_loader, device, threshold=0.5, model_name="Model"):
@@ -117,14 +120,14 @@ def analyze_confusion_matrix(model, val_loader, device, threshold=0.5, model_nam
     precision = precision_score(all_labels, all_preds, zero_division=0)
     recall = recall_score(all_labels, all_preds, zero_division=0) # Sensitivity
     
-    predicted_positive_ratio = (tp + fp) / len(all_labels)
+    predicted_positive_ratio = (tp + fp) / len(all_labels) if len(all_labels) > 0 else 0
     
     print(f"=== {model_name} (Threshold: {threshold}) ===")
     print(f"Total Validation Samples: {len(all_labels)}")
-    print(f"TP (True Positive - Hit)      : {tp}")
-    print(f"FN (False Negative - Missed TB): {fn}")
-    print(f"TN (True Negative - Correct Normal) : {tn}")
-    print(f"FP (False Positive - False Alarm)   : {fp}")
+    print(f"TP (True Positive - Hit)        : {tp}")
+    print(f"FN (False Negative - Missed TB) : {fn}")
+    print(f"TN (True Negative - Correct)    : {tn}")
+    print(f"FP (False Positive - False Alarm): {fp}")
     print(f"--------------------------------------")
     print(f"Precision            : {precision:.4f}")
     print(f"Recall (Sensitivity) : {recall:.4f}")
@@ -134,8 +137,9 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     image_dir = "/content/drive/MyDrive/TB_data/Shenzhen/ChinaSet_AllFiles/ChinaSet_AllFiles/CXR_png"
     
-    # Paths to the pre-trained models from Phase 1
+    # Paths to the pre-trained models from Phase 1 (Added ImageNet Baseline)
     weight_paths = {
+        "ImageNet_Baseline": None,
         "ICH_Only": "/content/drive/MyDrive/TB_data/ich_model.pth",
         "CCH_Only": "/content/drive/MyDrive/TB_data/cch_model.pth",
         "TCL_Full (ICH+CCH)": "/content/drive/MyDrive/TB_data/both_model.pth"
@@ -172,7 +176,8 @@ if __name__ == '__main__':
 
     # Loop through each ablation architecture
     for model_name, w_path in weight_paths.items():
-        if not os.path.exists(w_path): continue
+        if w_path is not None and not os.path.exists(w_path): 
+            continue
             
         auroc_results, f1_results = [], []
         
@@ -204,6 +209,10 @@ if __name__ == '__main__':
                 best_auroc = max(best_auroc, val_metrics['AUROC'])
                 best_f1 = max(best_f1, val_metrics['F1'])
             
+            # Print Confusion Matrix right after the 5-epoch cycle for the 10% data regime
+            if frac == 0.1:
+                analyze_confusion_matrix(model, val_loader, device, threshold=0.5, model_name=f"{model_name} (Seed {seed})")
+
             auroc_results.append(best_auroc)
             f1_results.append(best_f1)
  
