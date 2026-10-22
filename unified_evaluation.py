@@ -9,6 +9,7 @@ Rigorous, leakage-free downstream evaluation protocol:
 
 import os
 import random
+from glob import glob
 import numpy as np
 import pandas as pd
 import torch
@@ -25,12 +26,32 @@ from data_loader import (
 from model import CXRClassifier
 
 
-def set_ deterministic_seed(seed):
+def set_deterministic_seed(seed):
     """Fixes all random number generators for reproducible multi-seed experiments."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_checkpoint_path(base_dir, candidate_names):
+    """
+    Searches for a pretrained checkpoint (.pth) across the base_dir and its subdirectories
+    so that minor filename or folder differences do not trigger a FileNotFoundError.
+    """
+    for name in candidate_names:
+        direct_path = os.path.join(base_dir, name)
+        if os.path.exists(direct_path):
+            return direct_path
+        # Recursive search inside TB_data and current working directory
+        matches = glob(os.path.join(base_dir, "**", name), recursive=True)
+        if matches:
+            return matches[0]
+        local_matches = glob(os.path.join(".", "**", name), recursive=True)
+        if local_matches:
+            return local_matches[0]
+    return os.path.join(base_dir, candidate_names[0])
 
 
 @torch.no_grad()
@@ -42,10 +63,13 @@ def evaluate_model(model, dataloader, device, threshold=0.5):
     model.eval()
     all_probs, all_targets = [], []
 
-    for images, labels, _ in dataloader:
+    for batch in dataloader:
+        # Handle both (images, labels, filenames) and (images, labels) formats safely
+        images, labels = batch[0], batch[1]
         images = images.to(device)
         # Obtain predicted probabilities via sigmoid activation
-        probs = torch.sigmoid(model(images)).cpu().numpy()
+        logits = model(images).view(-1)
+        probs = torch.sigmoid(logits).cpu().numpy()
         all_probs.extend(probs)
         all_targets.extend(labels.numpy())
 
@@ -99,7 +123,13 @@ def run_single_experiment(model_name, ckpt_path, files, labels, fraction, seed, 
 
     # Load SSL pretrained weights if not ImageNet baseline
     if not is_imagenet and ckpt_path is not None:
-        model.load_ssl_encoder(ckpt_path, device=device)
+        if os.path.exists(ckpt_path):
+            model.load_ssl_encoder(ckpt_path, device=device)
+        else:
+            raise FileNotFoundError(
+                f"[{model_name}] Pretrained checkpoint not found at: {ckpt_path}\n"
+                f"Please verify your .pth file location inside /content/drive/MyDrive/TB_data"
+            )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
@@ -110,10 +140,11 @@ def run_single_experiment(model_name, ckpt_path, files, labels, fraction, seed, 
     # Supervised fine-tuning loop
     for epoch in range(epochs):
         model.train()
-        for images, targets, _ in train_loader:
-            images, targets = images.to(device), targets.to(device)
+        for batch in train_loader:
+            images, targets = batch[0].to(device), batch[1].to(device).float()
             optimizer.zero_grad()
-            loss = criterion(model(images), targets)
+            logits = model(images).view(-1)
+            loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
 
@@ -135,26 +166,51 @@ def run_single_experiment(model_name, ckpt_path, files, labels, fraction, seed, 
 
 if __name__ == "__main__":
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    SHENZHEN_DIR = "./data/Shenzhen"
-    CKPT_DIR = "./checkpoints"
+
+    # =========================================================================
+    # Google Drive File Paths (Configured to match your exact directory layout)
+    # =========================================================================
+    TBDATA_DIR = "/content/drive/MyDrive/TB_data"
+    SHENZHEN_DIR = "/content/drive/MyDrive/TB_data/Shenzhen/ChinaSet_AllFiles/ChinaSet_AllFiles/CXR_png"
+    MONTGOMERY_DIR = "/content/drive/MyDrive/TB_data/Shenzhen/Montgomery/MontgomerySet/CXR_png"
+    NIH_DIR = "/content/drive/MyDrive/TB_data/images_001/images"
+
     SEEDS = [42, 77, 123]
 
+    # Load Shenzhen dataset for internal fine-tuning and evaluation
     files, labels = load_tb_filepaths_and_labels(SHENZHEN_DIR)
+    print(f"Loaded Shenzhen dataset: {len(files)} images (Positive TB: {int(labels.sum())})")
+
+    # Load Montgomery dataset for zero-shot external validation
+    mont_files, mont_labels = load_tb_filepaths_and_labels(MONTGOMERY_DIR)
+    mont_loader = DataLoader(
+        CXRDataset(mont_files, mont_labels, get_downstream_transforms(is_train=False)),
+        batch_size=16, shuffle=False
+    )
+    print(f"Loaded Montgomery dataset: {len(mont_files)} images (Positive TB: {int(mont_labels.sum())})")
+
+    # Automatically locate pretrained SSL checkpoints inside TB_data
+    simclr_ckpt = resolve_checkpoint_path(TBDATA_DIR, ["SimCLR_xception_ssl.pth", "simclr_xception.pth", "pretrain_SimCLR.pth"])
+    tcl_ckpt    = resolve_checkpoint_path(TBDATA_DIR, ["TCL_Full_xception_ssl.pth", "BOTH_xception_ssl.pth", "tcl_xception.pth", "pretrain_BOTH.pth"])
+    ich_ckpt    = resolve_checkpoint_path(TBDATA_DIR, ["ICH_Only_xception_ssl.pth", "ICH_xception_ssl.pth", "pretrain_ICH.pth"])
+    cch_ckpt    = resolve_checkpoint_path(TBDATA_DIR, ["CCH_Only_xception_ssl.pth", "CCH_xception_ssl.pth", "pretrain_CCH.pth"])
 
     # Define experimental matrix: (Model Name, Checkpoint Path, Label Fractions)
     experiments = [
-        ("ImageNet", None, [0.10, 0.25, 0.50, 1.00]),
-        ("SimCLR", os.path.join(CKPT_DIR, "SimCLR_xception_ssl.pth"), [0.10, 0.25, 0.50, 1.00]),
-        ("TCL_Full", os.path.join(CKPT_DIR, "TCL_Full_xception_ssl.pth"), [0.10, 0.25, 0.50, 1.00]),
-        ("ICH_Only", os.path.join(CKPT_DIR, "ICH_Only_xception_ssl.pth"), [0.10]),
-        ("CCH_Only", os.path.join(CKPT_DIR, "CCH_Only_xception_ssl.pth"), [0.10]),
+        ("ImageNet", None,        [0.10, 0.25, 0.50, 1.00]),
+        ("SimCLR",   simclr_ckpt, [0.10, 0.25, 0.50, 1.00]),
+        ("TCL_Full", tcl_ckpt,    [0.10, 0.25, 0.50, 1.00]),
+        ("ICH_Only", ich_ckpt,    [0.10]),
+        ("CCH_Only", cch_ckpt,    [0.10]),
     ]
 
     records = []
+    ext_records = []
+
     for model_name, ckpt_path, fractions in experiments:
         for frac in fractions:
             for seed in SEEDS:
-                metrics, _ = run_single_experiment(
+                metrics, trained_model = run_single_experiment(
                     model_name, ckpt_path, files, labels, frac, seed, DEVICE
                 )
                 records.append({
@@ -167,7 +223,19 @@ if __name__ == "__main__":
                     "Specificity": metrics["Specificity"]
                 })
 
-    # Aggregate 3-seed results using population standard deviation (ddof=0)
+                # Run zero-shot external evaluation on Montgomery for the 10% label regime
+                if frac == 0.10 and model_name in ["ImageNet", "SimCLR", "TCL_Full"]:
+                    ext_metrics = evaluate_model(trained_model, mont_loader, DEVICE)
+                    ext_records.append({
+                        "Model": model_name,
+                        "Seed": seed,
+                        "AUROC": ext_metrics["AUROC"],
+                        "F1": ext_metrics["F1"],
+                        "Recall": ext_metrics["Recall"],
+                        "Specificity": ext_metrics["Specificity"]
+                    })
+
+    # Aggregate 3-seed Shenzhen results using population standard deviation (ddof=0)
     df = pd.DataFrame(records)
     summary = df.groupby(["Model", "Label_Fraction"]).agg(
         AUROC_mean=("AUROC", "mean"),
@@ -177,7 +245,33 @@ if __name__ == "__main__":
     ).reset_index()
 
     print("\n=====================================================")
-    print(" FINAL ROBUST RESULTS (Three-seed evaluation) ")
+    print(" FINAL ROBUST RESULTS - SHENZHEN (Three-seed eval) ")
     print("=====================================================")
-    print(summary.to_markdown(index=False))
-    summary.to_csv("Unified_Evaluation_Results_v2.csv", index=False)
+    print(summary.to_string(index=False))
+
+    out_csv = os.path.join(TBDATA_DIR, "Unified_Evaluation_Results_v2.csv")
+    summary.to_csv(out_csv, index=False)
+    print(f"Saved Shenzhen summary to: {out_csv}")
+
+    # Aggregate 3-seed Montgomery external validation results
+    if ext_records:
+        df_ext = pd.DataFrame(ext_records)
+        ext_summary = df_ext.groupby(["Model"]).agg(
+            AUROC_mean=("AUROC", "mean"),
+            AUROC_std=("AUROC", lambda x: np.std(x, ddof=0)),
+            F1_mean=("F1", "mean"),
+            F1_std=("F1", lambda x: np.std(x, ddof=0)),
+            Recall_mean=("Recall", "mean"),
+            Recall_std=("Recall", lambda x: np.std(x, ddof=0)),
+            Spec_mean=("Specificity", "mean"),
+            Spec_std=("Specificity", lambda x: np.std(x, ddof=0))
+        ).reset_index()
+
+        print("\n=====================================================")
+        print(" EXTERNAL VALIDATION - MONTGOMERY (10% Models) ")
+        print("=====================================================")
+        print(ext_summary.to_string(index=False))
+
+        ext_csv = os.path.join(TBDATA_DIR, "Montgomery_External_Results_v2.csv")
+        ext_summary.to_csv(ext_csv, index=False)
+        print(f"Saved Montgomery summary to: {ext_csv}")
