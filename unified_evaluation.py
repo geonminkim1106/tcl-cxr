@@ -135,8 +135,8 @@ def run_single_experiment(model_name, ckpt_path, files, labels, fraction, seed, 
 
 if __name__ == "__main__":
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    SHENZHEN_DIR = "./data/Shenzhen"
-    CKPT_DIR = "./checkpoints"
+    SHENZHEN_DIR = "/content/drive/MyDrive/TB_data/Shenzhen/ChinaSet_AllFiles/ChinaSet_AllFiles/CXR_png"
+    CKPT_DIR = "/content/drive/MyDrive/TB_data"
     SEEDS = [42, 77, 123]
 
     files, labels = load_tb_filepaths_and_labels(SHENZHEN_DIR)
