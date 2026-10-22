@@ -66,11 +66,11 @@ Consequently, the primary objectives of this study evolved to:
 | **100%** | **0.9369 ± 0.0086** | **0.8900 ± 0.0056** | 0.9316 ± 0.0109 | 0.8620 ± 0.0043 | 0.9195 ± 0.0147 | 0.8634 ± 0.0205 |
 
 <p align="center">
-  <img src="assets/images/figure 2.jpg" width="750">
+  <img src="assets/images/figure 2.png" width="750">
 </p>
 <p align="center"><i>Figure 2. Downstream AUROC and F1-Score scaling curves across labeled data fractions (10%–100%).</i></p>
 
-* **Key Observation:** **SimCLR** consistently achieved the highest AUROC and F1-score with the lowest seed-to-seed variance across all label budgets. Under extreme label scarcity (10%), SimCLR maintained a robust F1-score of **0.7928**, whereas **TCL** suffered from severe optimization instability (F1 **0.4135 ± 0.2976**, including complete prediction collapse at threshold 0.5 in one seed), underperforming even the ImageNet baseline (**0.5911**).
+* **Key Observation:** SimCLR consistently achieved the highest AUROC and F1-score with the lowest seed-to-seed variance across all label budgets. Under extreme label scarcity (10%), SimCLR maintained a robust F1-score of 0.7928, whereas TCL suffered from severe optimization instability (F1 0.4135 ± 0.2976, including complete prediction collapse at threshold 0.5 in one seed), underperforming even the ImageNet baseline (0.5911).
 
 ---
 
@@ -86,7 +86,7 @@ Consequently, the primary objectives of this study evolved to:
 </p>
 <p align="center"><i>Figure 3. Internal (Shenzhen) vs. Cross-Domain (Montgomery) generalization performance.</i></p>
 
-* **Key Observation:** When evaluated directly on the unseen Montgomery cohort without re-tuning, **SimCLR** preserved the highest discriminative power (AUROC **0.774**) and operational F1-score (**0.677**), driven by strong sensitivity (Recall **0.851**). While TCL exhibited higher specificity (**0.688**), its overall diagnostic sensitivity dropped sharply, indicating distinct operating trade-offs under domain shift.
+* **Key Observation:** When evaluated directly on the unseen Montgomery cohort without re-tuning, SimCLR preserved the highest discriminative power (AUROC 0.774) and operational F1-score (0.677), driven by strong sensitivity (Recall 0.851). While TCL exhibited higher specificity (0.688), its overall diagnostic sensitivity dropped sharply, indicating distinct operating trade-offs under domain shift.
 
 ---
 
@@ -99,7 +99,7 @@ Consequently, the primary objectives of this study evolved to:
 | **TCL-Full (ICH + CCH)** | 0.7306 ± 0.0484 | 0.4135 ± 0.2976 |
 
 <p align="center">
-  <img src="assets/images/figure 4.jpg" width="750">
+  <img src="assets/images/figure 4.png" width="750">
 </p>
 <p align="center"><i>Figure 4. Threshold sensitivity analysis showing F1-Score and Recall across decision thresholds (0.1–0.9).</i></p>
 
@@ -108,20 +108,20 @@ Consequently, the primary objectives of this study evolved to:
 </p>
 <p align="center"><i>Figure 5. Ablation study comparing individual TCL heads (ICH-Only, CCH-Only, and TCL-Full) at the 10% label budget.</i></p>
 
-* **Rank vs. Threshold Divergence:** In the ablation study, `CCH-Only` achieved a relatively high AUROC (**0.8171**) but a low F1-score (**0.5812**), whereas `ICH-Only` showed lower AUROC (**0.6992**) but superior F1-score (**0.6339**). During pretraining, the `CCH-Only` loss plateaued near $\ln(1024) \approx 6.93$, indicating stagnant cluster assignment. Combining both heads in `TCL-Full` resulted in negative synergy under the 10% regime, severely degrading probability calibration around the default `0.5` decision boundary.
+* **Rank vs. Threshold Divergence:** In the ablation study, `CCH-Only` achieved a relatively high AUROC (0.8171) but a low F1-score (0.5812), whereas `ICH-Only` showed lower AUROC (0.6992) but superior F1-score (0.6339). During pretraining, the `CCH-Only` loss plateaued near $\ln(1024) \approx 6.93$, indicating stagnant cluster assignment. Combining both heads in `TCL-Full` resulted in negative synergy under the 10% regime, severely degrading probability calibration around the default `0.5` decision boundary.
 
 ---
 
 ## 4. Qualitative Analysis & Discussion (Grad-CAM)
 
 <p align="center">
-  <img src="assets/images/figure 61.jpg" width="750">
+  <img src="assets/images/figure 61.png" width="750">
 </p>
 <p align="center"><i>Figure 6. Grad-CAM spatial activation maps and predicted probabilities across identical test radiographs for ImageNet, SimCLR, and TCL (10% label budget).</i></p>
 
 ### Spatial Activation Patterns & Potential Bias
-1. **TCL's Horizontal Band Artifact & Probabilistic Collapse:** Across multiple test radiographs, `TCL` repeatedly generated a horizontal band-like activation along the lower thorax while outputting nearly invariant probabilities hovering at **0.508–0.509**. This suggests that forcing rigid cluster assignments on heterogeneous CXRs may induce optimization difficulties or spatial shortcut learning rather than anatomically grounded representations.
-2. **ImageNet's Boundary & Mediastinal Bias:** `ImageNet` heavily focused on high-contrast edges such as the central cardiac shadow and diaphragm, with output probabilities stagnating at **0.497**, reflecting severe domain shift under minimal fine-tuning labels.
+1. **TCL's Horizontal Band Artifact & Probabilistic Collapse:** Across multiple test radiographs, `TCL` repeatedly generated a horizontal band-like activation along the lower thorax while outputting nearly invariant probabilities hovering at 0.508–0.509. This suggests that forcing rigid cluster assignments on heterogeneous CXRs may induce optimization difficulties or spatial shortcut learning rather than anatomically grounded representations.
+2. **ImageNet's Boundary & Mediastinal Bias:** `ImageNet` heavily focused on high-contrast edges such as the central cardiac shadow and diaphragm, with output probabilities stagnating at 0.497, reflecting severe domain shift under minimal fine-tuning labels.
 3. **SimCLR's Broader Thoracic Coverage (and Remaining Shortcuts):** Without rigid clustering constraints, `SimCLR` maintained a continuous representation space that activated more broadly across the lung fields and produced better-separated prediction probabilities. However, its heatmaps also partially spilled into peripheral background corners, demonstrating that unconstrained SSL still requires spatial guidance (e.g., lung segmentation masks) to fully eliminate background shortcuts.
 
 ---
