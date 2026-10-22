@@ -2,7 +2,7 @@
 
 **Independent Research Project**
 
-An empirical investigation comparing instance-level (**SimCLR**) and cluster-level (**Twin Contrastive Learning, TCL**) self-supervised pretraining objectives for label-efficient chest X-ray (CXR) tuberculosis classification.
+An empirical investigation comparing instance-level (SimCLR) and cluster-level (Twin Contrastive Learning, TCL) self-supervised pretraining objectives for label-efficient chest X-ray (CXR) tuberculosis classification.
 
 <p align="center">
   <img src="assets/images/pipeline.png" width="750">
