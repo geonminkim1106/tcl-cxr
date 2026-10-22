@@ -5,9 +5,14 @@
 An empirical comparison of supervised ImageNet pretraining and self-supervised contrastive learning approaches—SimCLR and Twin Contrastive Learning (TCL)—for tuberculosis (TB) classification from chest X-ray (CXR) images under limited-label conditions.
 
 <p align="center">
-  <img src="assets/images/pipeline.png" width="750" alt="TCL-CXR experimental pipeline">
+  <img src="assets/images/overall_pipeline.png" width="750" alt="TCL-CXR experimental pipeline">
 </p>
 <p align="center"><em>Figure 1. Overview of self-supervised pretraining on NIH ChestX-ray14 and downstream evaluation on the Shenzhen and Montgomery TB datasets.</em></p>
+
+<p align="center">
+  <img src="assets/images/pipeline.png" width="750" alt="TCL-CXR experimental pipeline">
+</p>
+<p align="center"><em>Figure 2. Overview of Twin Contrastive Learning (TCL).</em></p>
 
 ---
 
@@ -86,7 +91,7 @@ The table reports mean ± population standard deviation across three seeds. F1-s
 <p align="center">
   <img src="assets/images/figure 2.png" width="750" alt="AUROC and F1-score across label budgets">
 </p>
-<p align="center"><em>Figure 2. AUROC and F1-score across labeled-data budgets on the Shenzhen test set.</em></p>
+<p align="center"><em>Figure 3. AUROC and F1-score across labeled-data budgets on the Shenzhen test set.</em></p>
 
 **Key Observation:** SimCLR achieved the highest mean AUROC and F1-score at all four evaluated label budgets. At the 10% label budget, TCL showed substantial seed-to-seed variability in F1-score (0.4135 ± 0.2976), including one run with an F1-score of 0 at the fixed 0.5 threshold. This result warrants further investigation into prediction behavior and training stability; it does not by itself establish the cause of the low score.
 
@@ -101,7 +106,7 @@ The table reports mean ± population standard deviation across three seeds. F1-s
 <p align="center">
   <img src="assets/images/figure 3.png" width="750" alt="Internal and external evaluation comparison">
 </p>
-<p align="center"><em>Figure 3. Performance comparison on the Shenzhen internal test set and the Montgomery external cohort.</em></p>
+<p align="center"><em>Figure 4. Performance comparison on the Shenzhen internal test set and the Montgomery external cohort.</em></p>
 
 **Key Observation:** In the reported Montgomery evaluation, SimCLR achieved the highest AUROC, F1-score, and recall, while TCL had the highest specificity. This indicates different operating trade-offs at the fixed threshold. These results should be interpreted in light of the small size of the external cohort.
 
@@ -119,12 +124,12 @@ The following ablation results use the 10% label budget. F1-scores are measured 
 <p align="center">
   <img src="assets/images/figure 4.png" width="750" alt="F1-score and recall across decision thresholds">
 </p>
-<p align="center"><em>Figure 4. F1-score and recall across decision thresholds from 0.1 to 0.9.</em></p>
+<p align="center"><em>Figure 5. F1-score and recall across decision thresholds from 0.1 to 0.9.</em></p>
 
 <p align="center">
   <img src="assets/images/figure 5.png" width="480" alt="TCL component ablation comparison">
 </p>
-<p align="center"><em>Figure 5. Comparison of ICH-Only, CCH-Only, and TCL-Full at the 10% label budget.</em></p>
+<p align="center"><em>Figure 6. Comparison of ICH-Only, CCH-Only, and TCL-Full at the 10% label budget.</em></p>
 
 **Key Observation:** CCH-Only achieved an AUROC similar to the ImageNet baseline but a lower mean F1-score at the fixed threshold. ICH-Only achieved the highest mean F1-score among the listed variants, while TCL-Full had the lowest mean F1-score and substantial variability. Under this experimental setup, combining the two heads did not improve the reported metrics over the better-performing ablation. Further diagnostics are needed to determine why.
 
@@ -137,9 +142,9 @@ AUROC measures ranking discrimination across thresholds, whereas F1-score depend
 ## 4. Exploratory Grad-CAM Analysis
 
 <p align="center">
-  <img src="assets/images/figure 6.png" width="750" alt="Grad-CAM comparison across ImageNet, SimCLR, and TCL">
+  <img src="assets/images/figure 61.png" width="750" alt="Grad-CAM comparison across ImageNet, SimCLR, and TCL">
 </p>
-<p align="center"><em>Figure 6. Grad-CAM maps and predicted probabilities for the same test radiographs, comparing ImageNet, SimCLR, and TCL at the 10% label budget.</em></p>
+<p align="center"><em>Figure 7. Grad-CAM maps and predicted probabilities for the same test radiographs, comparing ImageNet, SimCLR, and TCL at the 10% label budget.</em></p>
 
 The Grad-CAM visualizations provide qualitative examples of where the models' predictions are associated with activation in the selected feature maps. They can motivate further investigation, but they do not establish causal explanations for model behavior.
 
@@ -174,6 +179,7 @@ The Grad-CAM visualizations provide qualitative examples of where the models' pr
 TCL-CXR/
 ├── assets/
 │   └── images/
+│       ├── overall_pipeline.png
 │       ├── pipeline.png
 │       ├── figure 2.png
 │       ├── figure 3.png
