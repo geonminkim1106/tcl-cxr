@@ -69,7 +69,7 @@ def train_ssl_objective(mode, dataloader, device, epochs=50, lr=3e-4, save_dir="
 
 if __name__ == "__main__":
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    NIH_DATA_DIR = "./data/NIH_4005_subset"  # Path to patient-split 4,005 NIH radiographs
+    NIH_DATA_DIR = "/content/drive/MyDrive/TB_data/images_001/images"  # Path to patient-split 4,005 NIH radiographs
 
     # Load unlabeled file paths and build SSL DataLoader
     nih_files = sorted(glob(os.path.join(NIH_DATA_DIR, "*.png")))
