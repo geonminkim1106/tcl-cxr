@@ -56,7 +56,7 @@ class GradCAMExtractor:
         return cam, prob
 
 
-def plot_gradcam_grid(image_paths, models_dict, device, save_path="assets/images/figure 61.jpg"):
+def plot_gradcam_grid(image_paths, models_dict, device, save_path="/content/drive/MyDrive/TB_data/figure 61.png"):
     """
     Renders the 4x4 qualitative comparison grid across 4 test patients and 3 models.
     """
