@@ -12,7 +12,7 @@ from data_loader import CXRDataset, get_ssl_transforms
 from model import XceptionSSLModel, NTXentLoss, ClusterContrastiveLoss
 
 
-def train_ssl_objective(mode, dataloader, device, epochs=50, lr=3e-4, save_dir="./checkpoints"):
+def train_ssl_objective(mode, dataloader, device, epochs=50, lr=3e-4, save_dir="/content/drive/MyDrive/TB_data"):
     """
     Executes SSL pretraining for a specified objective ('SimCLR', 'ICH_Only', 'CCH_Only', 'TCL_Full').
     """
@@ -78,4 +78,4 @@ if __name__ == "__main__":
 
     # Sequentially pretrain all compared objectives
     for objective_mode in ["SimCLR", "TCL_Full", "ICH_Only", "CCH_Only"]:
-        train_ssl_objective(objective_mode, ssl_loader, DEVICE, epochs=50)
+        train_ssl_objective(objective_mode, ssl_loader, DEVICE, epochs=50)    
