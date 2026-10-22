@@ -1,185 +1,112 @@
-import os
-import random
+"""
+gradcam_vis.py
+Generates the 4x4 Grad-CAM qualitative comparison grid across identical test radiographs
+for ImageNet, SimCLR, and TCL, displaying predicted probabilities and spatial attention biases.
+"""
+
+import cv2
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as T
-from sklearn.model_selection import StratifiedShuffleSplit
-from PIL import Image
 import matplotlib.pyplot as plt
- 
-import timm
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
+from PIL import Image
+from data_loader import get_downstream_transforms
 
-def set_seed(seed=42):
-    """Locks random seeds to ensure visualization targets are consistent."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
-set_seed(42)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class GradCAMExtractor:
+    """
+    Hooks into the final depthwise separable convolutional layer of the Xception encoder
+    to compute class-discriminative Grad-CAM spatial heatmaps.
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
 
-image_dir = "/content/drive/MyDrive/TB_data/Shenzhen/ChinaSet_AllFiles/ChinaSet_AllFiles/CXR_png"
-w_path = "/content/drive/MyDrive/TB_data/both_model.pth"
+        # Register forward and backward hooks on the target convolutional block
+        self.target_layer.register_forward_hook(self._save_activation)
+        self.target_layer.register_full_backward_hook(self._save_gradient)
 
-# Load Shenzhen Dataset metadata
-file_list = [f for f in os.listdir(image_dir) if f.endswith('.png')]
-df_list = [{'filename': f, 'label': int(f.split('_')[-1][0])} for f in file_list]
-real_df = pd.DataFrame(df_list)
+    def _save_activation(self, module, input, output):
+        self.activations = output.detach()
 
-# Recreate the exact same 10% data split used in evaluation
-sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-train_idx, val_idx = next(sss.split(real_df, real_df['label']))
-full_train_df = real_df.iloc[train_idx].reset_index(drop=True)
-val_df = real_df.iloc[val_idx].reset_index(drop=True)
+    def _save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
 
-sss_sub = StratifiedShuffleSplit(n_splits=1, train_size=0.1, random_state=42)
-sub_idx, _ = next(sss_sub.split(full_train_df, full_train_df['label']))
-train_df = full_train_df.iloc[sub_idx].reset_index(drop=True)
+    def generate(self, input_tensor):
+        """Computes the normalized Grad-CAM heatmap and positive prediction probability."""
+        self.model.eval()
+        self.model.zero_grad()
 
-class TBClassificationDataset(Dataset):
-    """Dataset modified to also return the unnormalized original image for overlay visualization."""
-    def __init__(self, dataframe, image_dir, transform=None):
-        self.df = dataframe
-        self.image_dir = image_dir
-        self.transform = transform
+        # Forward pass to get binary logit and probability
+        logit = self.model(input_tensor)
+        prob = torch.sigmoid(logit).item()
 
-    def __len__(self):
-        return len(self.df)
+        # Backward pass with respect to the positive TB logit
+        logit.backward()
 
-    def __getitem__(self, idx):
-        img_name = self.df.loc[idx, 'filename']
-        img_path = os.path.join(self.image_dir, img_name)
-        image = Image.open(img_path).convert('RGB')
-        label = self.df.loc[idx, 'label']
-        
-        # Save a resized original copy for Grad-CAM overlay
-        orig_image = image.resize((224, 224)) 
-        
-        if self.transform:
-            image_tensor = self.transform(image)
-        return image_tensor, torch.tensor(label, dtype=torch.float32), np.array(orig_image), img_name
+        # Global average pooling over spatial gradients: alpha_k = mean_{u,v}(dY / dA^k_{u,v})
+        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
+        # Weighted combination of forward activation maps followed by ReLU
+        cam = torch.sum(weights * self.activations, dim=1).squeeze(0)
+        cam = torch.relu(cam).cpu().numpy()
 
-train_transform = T.Compose([
-    T.Resize((224, 224)), T.RandomHorizontalFlip(p=0.5),
-    T.ColorJitter(brightness=0.1, contrast=0.1), T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-val_transform = T.Compose([
-    T.Resize((224, 224)), T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+        # Normalize heatmap to [0, 1] range
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        return cam, prob
 
-train_dataset = TBClassificationDataset(train_df, image_dir, transform=train_transform)
-val_dataset = TBClassificationDataset(val_df, image_dir, transform=val_transform)
 
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False) # Batch size 1 for targeted visualization
+def plot_gradcam_grid(image_paths, models_dict, device, save_path="assets/images/figure 61.jpg"):
+    """
+    Renders the 4x4 qualitative comparison grid across 4 test patients and 3 models.
+    """
+    transform = get_downstream_transforms(img_size=224, is_train=False)
+    fig, axes = plt.subplots(len(image_paths), 4, figsize=(12, 12))
 
-class TBClassifier(nn.Module):
-    """Classifier structure tailored to allow Grad-CAM hooks."""
-    def __init__(self, pretrained_model_path=None):
-        super(TBClassifier, self).__init__()
-        self.backbone = timm.create_model('xception', pretrained=False, num_classes=0)
-        
-        if pretrained_model_path and os.path.exists(pretrained_model_path):
-            state_dict = torch.load(pretrained_model_path, map_location='cpu')
-            backbone_state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items() if k.startswith('backbone.')}
-            self.backbone.load_state_dict(backbone_state_dict, strict=False)
-            
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(2048, 1)
-        )
+    col_titles = ["Original CXR", "ImageNet Base", "SimCLR", "TCL"]
+    for col_idx, title in enumerate(col_titles):
+        axes[0, col_idx].set_title(title, fontsize=13, fontweight="bold")
 
-    def forward(self, x):
-        features = self.backbone(x)
-        logits = self.classifier(features)
-        # Note: Do not squeeze(-1) here to maintain compatibility with pytorch_grad_cam requirements
-        return logits 
+    for row_idx, img_path in enumerate(image_paths):
+        # Load raw grayscale/RGB image for visual overlay
+        raw_img = Image.open(img_path).convert("RGB").resize((224, 224))
+        raw_np = np.array(raw_img) / 255.0
 
-model = TBClassifier(pretrained_model_path=w_path).to(device)
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
+        # Plot column 0: Original Radiograph
+        axes[row_idx, 0].imshow(raw_np)
+        axes[row_idx, 0].set_ylabel(img_path.split("/")[-1], fontsize=9)
+        axes[row_idx, 0].set_xticks([])
+        axes[row_idx, 0].set_yticks([])
 
-# Fine-tune the model rapidly to establish decision boundaries for visualization
-for epoch in range(5):
-    model.train()
-    for images, labels, _, _ in train_loader:
-        images, labels = images.to(device), labels.to(device).unsqueeze(-1)
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        # Prepare normalized input tensor
+        input_tensor = transform(raw_img).unsqueeze(0).to(device)
 
-model.eval()
+        # Plot columns 1–3: ImageNet, SimCLR, and TCL Grad-CAM overlays
+        for col_idx, model_key in enumerate(["ImageNet", "SimCLR", "TCL"], start=1):
+            model = models_dict[model_key]
+            # Hook into the final convolutional layer of timm's legacy_xception (act4 / conv4)
+            extractor = GradCAMExtractor(model, model.encoder.act4)
+            cam, prob = extractor.generate(input_tensor)
 
-# Set the target layer for Grad-CAM. 'conv4' is typically the final block in legacy_xception.
-target_layers = [model.backbone.conv4]
-# Index 0 represents the singular logit output of our binary classifier
-targets = [ClassifierOutputTarget(0)]
-cam = GradCAM(model=model, target_layers=target_layers)
+            # Resize CAM to 224x224 and apply JET colormap
+            cam_resized = cv2.resize(cam, (224, 224))
+            heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
 
-# Extract exactly 2 Normal and 2 TB samples from the validation set
-sample_images = {'Normal': [], 'TB': []}
-for image_tensor, label, orig_image, img_name in val_loader:
-    lbl_idx = int(label.item())
-    key = 'TB' if lbl_idx == 1 else 'Normal'
-    if len(sample_images[key]) < 2:
-        sample_images[key].append((image_tensor, orig_image.squeeze(0), img_name[0], lbl_idx))
-    if len(sample_images['Normal']) == 2 and len(sample_images['TB']) == 2:
-        break
+            # Blend original CXR with heatmap
+            overlay = 0.55 * raw_np + 0.45 * heatmap
+            axes[row_idx, col_idx].imshow(overlay)
+            axes[row_idx, col_idx].axis("off")
 
-# Setup 2x4 plotting grid (Row 1: Normal, Row 2: TB. Each item occupies 2 columns for Original/CAM)
-fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-plt.subplots_adjust(wspace=0.1, hspace=0.3)
+            # Annotate predicted probability and threshold decision below each subplot
+            pred_label = "Positive" if prob >= 0.5 else "Negative"
+            color = "green" if prob >= 0.5 else "red"
+            axes[row_idx, col_idx].text(
+                0.5, -0.08, f"Prob: {prob:.3f} ({pred_label})",
+                color=color, fontweight="bold", fontsize=10,
+                ha="center", transform=axes[row_idx, col_idx].transAxes
+            )
 
-plot_idx = 0
-for key in ['Normal', 'TB']:
-    for img_tensor, orig_img, img_name, true_lbl in sample_images[key]:
-        input_tensor = img_tensor.to(device)
-        
-        # Get model prediction to display alongside true label
-        with torch.no_grad():
-            output = model(input_tensor)
-            prob = torch.sigmoid(output).item()
-            pred_lbl = 1 if prob > 0.5 else 0
-            
-        # Generate the heatmap
-        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)[0, :]
-        
-        # Normalize original image to [0, 1] bounds for the overlay utility
-        rgb_img = np.float32(orig_img) / 255.0
-        cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-        
-        # Safely compute row/column indices to avoid Out-Of-Bounds errors
-        row, col = plot_idx // 2, (plot_idx % 2) * 2
-        
-        # Plot 1: Unmodified Original X-ray
-        ax1 = axes[row, col]
-        ax1.imshow(orig_img)
-        ax1.axis('off')
-        ax1.set_title(f"True: {key}\n{img_name}", fontsize=10)
-        
-        # Plot 2: X-ray with Grad-CAM overlay
-        ax2 = axes[row, col + 1]
-        ax2.imshow(cam_image)
-        ax2.axis('off')
-        
-        # Format title text color dynamically based on correct/incorrect prediction
-        pred_text = "TB" if pred_lbl == 1 else "Normal"
-        color = "green" if pred_lbl == true_lbl else "red"
-        ax2.set_title(f"Pred: {pred_text} ({prob:.2f})", fontsize=10, color=color)
-        
-        plot_idx += 1
-
-plt.suptitle("TCL_Full (10% Data) - Grad-CAM Visualizations", fontsize=16, weight='bold')
-plt.show()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f" Saved 4x4 Grad-CAM comparison grid to {save_path}")
