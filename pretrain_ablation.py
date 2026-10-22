@@ -1,143 +1,81 @@
+"""
+pretrain_ablation.py
+Self-Supervised Pretraining script on the NIH ChestX-ray14 dataset (4,005 patient-split subset).
+Trains SimCLR, ICH-Only, CCH-Only, and TCL-Full sequentially under identical conditions.
+"""
+
 import os
-import pandas as pd
+from glob import glob
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
-from sklearn.model_selection import GroupShuffleSplit
+from data_loader import CXRDataset, get_ssl_transforms
+from model import XceptionSSLModel, NTXentLoss, ClusterContrastiveLoss
 
-# Import custom dataset and model components
-from data_loader import CXRContrastiveDataset, weak_transform, strong_transform
-from model import TCL_Xception
 
-class TCLLoss(nn.Module):
+def train_ssl_objective(mode, dataloader, device, epochs=50, lr=3e-4, save_dir="./checkpoints"):
     """
-    Dynamic Twin-Contrastive Loss module supporting Ablation modes (ICH, CCH, BOTH).
+    Executes SSL pretraining for a specified objective ('SimCLR', 'ICH_Only', 'CCH_Only', 'TCL_Full').
     """
-    def __init__(self, batch_size, temperature_inst=0.5, temperature_cluster=1.0):
-        super(TCLLoss, self).__init__()
-        self.batch_size = batch_size
-        self.temp_inst = temperature_inst                   # Temperature scaling for instance contrast
-        self.temp_cluster = temperature_cluster             # Temperature scaling for cluster contrast
-        self.criterion = nn.CrossEntropyLoss()
+    os.makedirs(save_dir, exist_ok=True)
+    # Initialize common Xception SSL architecture
+    model = XceptionSSLModel(backbone_name="legacy_xception").to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    def info_nce_loss(self, view1, view2, temperature):
-        """Calculates the standard InfoNCE loss for contrastive learning."""
-        features = torch.cat([view1, view2], dim=0)         # Concatenate both views [2*B, D]
-        
-        # Calculate cosine similarity matrix
-        similarity_matrix = torch.matmul(features, features.T) / temperature
-        
-        # Create a mask to remove self-similarity (diagonal elements)
-        mask = torch.eye(features.shape[0], dtype=torch.bool).to(features.device)
-        similarity_matrix = similarity_matrix[~mask].view(features.shape[0], -1)
+    # Instantiate instance-level (row-space) and cluster-level (column-space) losses
+    criterion_ich = NTXentLoss(temperature=0.5).to(device)
+    criterion_cch = ClusterContrastiveLoss(temperature=1.0).to(device)
 
-        # Calculate similarity between positive pairs (view1 and view2 of the same image)
-        positives = torch.sum(view1 * view2, dim=-1) / temperature
-        positives = torch.cat([positives, positives], dim=0).view(-1, 1)
+    print(f"\n Starting SSL Pretraining for [{mode}] ({epochs} Epochs)...")
+    model.train()
 
-        # Labels are always 0 because the positive pair is placed at the 0th index
-        labels = torch.zeros(features.shape[0], dtype=torch.long).to(features.device)
-        
-        # Concatenate positives and negatives to form logits
-        logits = torch.cat([positives, similarity_matrix], dim=1)
-        return self.criterion(logits, labels)
+    for epoch in range(1, epochs + 1):
+        epoch_loss = 0.0
+        for views in dataloader:
+            # Unpack positive pair of augmented radiographs
+            x_i, x_j = views[0].to(device), views[1].to(device)
+            optimizer.zero_grad()
 
-    def forward(self, z_i, z_j, c_i, c_j, mode='BOTH'):
-        # Calculate Instance-level loss (ICH)
-        loss_instance = self.info_nce_loss(z_i, z_j, self.temp_inst)
-        
-        # Calculate Cluster-level loss (CCH) across the batch dimension (using transposed probabilities)
-        p_i = nn.functional.softmax(c_i, dim=1)
-        p_j = nn.functional.softmax(c_j, dim=1)
-        loss_cluster = self.info_nce_loss(p_i.T, p_j.T, self.temp_cluster)
+            # Forward pass through Xception encoder and projection heads
+            _, z_i, c_i = model(x_i)
+            _, z_j, c_j = model(x_j)
 
-        # Dynamic mode switching for ablation studies
-        if mode == 'ICH':
-            total_loss = loss_instance
-            loss_cluster_val = 0.0
-            loss_inst_val = loss_instance.item()
-        elif mode == 'CCH':
-            total_loss = loss_cluster
-            loss_inst_val = 0.0
-            loss_cluster_val = loss_cluster.item()
-        else: # BOTH (TCL_Full)
-            total_loss = loss_instance + loss_cluster
-            loss_inst_val = loss_instance.item()
-            loss_cluster_val = loss_cluster.item()
+            # Select objective function based on experimental variant
+            if mode in ["SimCLR", "ICH_Only"]:
+                # Pure instance-level contrastive learning without cluster constraints
+                loss = criterion_ich(z_i, z_j)
+            elif mode == "CCH_Only":
+                # Pure cluster-level contrastive learning (observed to plateau near ln(1024) ≈ 6.93)
+                loss = criterion_cch(c_i, c_j)
+            elif mode == "TCL_Full":
+                # Twin Contrastive Learning combining both row-space and column-space objectives
+                loss = criterion_ich(z_i, z_j) + criterion_cch(c_i, c_j)
+            else:
+                raise ValueError(f"Unknown SSL mode: {mode}")
 
-        return total_loss, loss_inst_val, loss_cluster_val
+            # Backpropagation and parameter update
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(dataloader)
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"  [{mode}] Epoch [{epoch:02d}/{epochs:02d}] | Loss: {avg_loss:.4f}")
+
+    # Save purely the encoder state_dict for downstream fine-tuning transfer
+    ckpt_path = os.path.join(save_dir, f"{mode}_xception_ssl.pth")
+    torch.save({"encoder_state_dict": model.encoder.state_dict()}, ckpt_path)
+    print(f"Saved pretrained encoder weights to {ckpt_path}")
 
 
-if __name__ == '__main__':
-    # Define paths (Adjust to your local or cloud environment)
-    csv_path = "/content/drive/MyDrive/TB_data/Data_Entry_2017.csv"
-    image_dir = "/content/drive/MyDrive/TB_data/images_001/images"
-    save_dir = "/content/drive/MyDrive/TB_data/"
+if __name__ == "__main__":
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    NIH_DATA_DIR = "./data/NIH_4005_subset"  # Path to patient-split 4,005 NIH radiographs
 
-    # Hyperparameters
-    batch_size = 16 
-    epochs = 50 
-    learning_rate = 1e-4
+    # Load unlabeled file paths and build SSL DataLoader
+    nih_files = sorted(glob(os.path.join(NIH_DATA_DIR, "*.png")))
+    ssl_dataset = CXRDataset(file_paths=nih_files, labels=None, transform=get_ssl_transforms(224))
+    ssl_loader = DataLoader(ssl_dataset, batch_size=32, shuffle=True, num_workers=4, drop_last=True)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Load metadata and filter out missing images
-    df = pd.read_csv(csv_path)
-    existing_files = set(os.listdir(image_dir))
-    df = df[df['Image Index'].isin(existing_files)].reset_index(drop=True)
-
-    # Patient-level split to prevent data leakage (same patient appearing in both train and val)
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, val_idx = next(gss.split(df, groups=df['Patient ID']))
-    train_df = df.iloc[train_idx]
-
-    # Initialize Dataset and DataLoader
-    actual_batch_size = min(batch_size, len(train_df))
-    train_dataset = CXRContrastiveDataset(train_df, image_dir, weak_transform, strong_transform)
-    train_loader = DataLoader(train_dataset, batch_size=actual_batch_size, shuffle=True, num_workers=2, drop_last=True)
-
-    # Define ablation modes to run sequentially
-    ablation_modes = ['ICH', 'CCH', 'BOTH']
-
-    for mode in ablation_modes:
-        print(f"Starting {mode}-Only Pretraining ({epochs} Epochs)")
-        
-        # Reinitialize model and optimizer for each mode to ensure a clean slate
-        model = TCL_Xception(feature_dim=128, num_clusters=512).to(device)
-        criterion = TCLLoss(batch_size=actual_batch_size).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-        for epoch in range(epochs):
-            model.train()
-            epoch_loss = 0.0
-
-            for batch_idx, (view_1, view_2) in enumerate(train_loader):
-                # Move augmented views to GPU
-                view_1, view_2 = view_1.to(device), view_2.to(device)
-                optimizer.zero_grad()
-
-                # Forward pass for both views
-                z_i, c_i = model(view_1)
-                z_j, c_j = model(view_2)
-
-                # Compute loss based on the current ablation mode
-                loss, loss_inst_val, loss_clust_val = criterion(z_i, z_j, c_i, c_j, mode=mode)
-                
-                # Backpropagation
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-
-            avg_loss = epoch_loss / len(train_loader)
-            print(f"==> Epoch [{epoch + 1}/{epochs}] | {mode} Loss: {avg_loss:.4f}")
-
-            # Defensive Checkpointing: Save weights every 10 epochs to prevent data loss
-            if (epoch + 1) % 10 == 0:
-                temp_path = os.path.join(save_dir, f"{mode.lower()}_epoch_{epoch+1}.pth")
-                torch.save(model.state_dict(), temp_path)
-
-        # Save final weights for the current mode
-        save_path = os.path.join(save_dir, f"{mode.lower()}_model.pth")
-        torch.save(model.state_dict(), save_path)
+    # Sequentially pretrain all compared objectives
+    for objective_mode in ["SimCLR", "TCL_Full", "ICH_Only", "CCH_Only"]:
+        train_ssl_objective(objective_mode, ssl_loader, DEVICE, epochs=50)
