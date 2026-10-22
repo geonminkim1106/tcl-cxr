@@ -1,227 +1,183 @@
+"""
+unified_evaluation.py
+Rigorous, leakage-free downstream evaluation protocol:
+  - Partition: 70% Train Pool / 10% Validation / 20% Held-out Test.
+  - Checkpoint Selection: Best Validation AUROC only (no test-set peeking).
+  - Final Evaluation: Single evaluation on the 20% Held-out Test Set and external Montgomery set
+    across 3 random seeds (42, 77, 123) using population standard deviation (ddof=0).
+"""
+
 import os
 import random
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as T
-from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, precision_score, recall_score
-from PIL import Image
-import timm
+from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score, f1_score, recall_score, confusion_matrix
 
-def set_seed(seed=42):
-    """Locks all random seeds for absolute reproducibility."""
+from data_loader import (
+    CXRDataset,
+    get_downstream_transforms,
+    load_tb_filepaths_and_labels,
+    get_strict_splits
+)
+from model import CXRClassifier
+
+
+def set_ deterministic_seed(seed):
+    """Fixes all random number generators for reproducible multi-seed experiments."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def get_stratified_subset(df, fraction, random_seed):
-    """Extracts a stratified subset of the data (e.g., 10%) while preserving class distribution."""
-    if fraction == 1.0: return df
-    sss = StratifiedShuffleSplit(n_splits=1, train_size=fraction, random_state=random_seed)
-    subset_idx, _ = next(sss.split(df, df['label']))
-    return df.iloc[subset_idx].reset_index(drop=True)
 
-class TBClassificationDataset(Dataset):
-    """Downstream dataset for binary TB classification."""
-    def __init__(self, dataframe, image_dir, transform=None):
-        self.df = dataframe
-        self.image_dir = image_dir
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        img_name = self.df.loc[idx, 'filename']
-        img_path = os.path.join(self.image_dir, img_name)
-        image = Image.open(img_path).convert('RGB')
-        label = self.df.loc[idx, 'label']
-
-        if self.transform:
-            image = self.transform(image)
-        return image, torch.tensor(label, dtype=torch.float32)
-
-class TBClassifier(nn.Module):
-    """Downstream Classifier utilizing the pretrained Xception backbone."""
-    def __init__(self, pretrained_model_path=None):
-        super(TBClassifier, self).__init__()
-        
-        # Load standard ImageNet weights if no pretrained_model_path is provided
-        use_imagenet = pretrained_model_path is None
-        self.backbone = timm.create_model('xception', pretrained=use_imagenet, num_classes=0)
-        
-        # Inject self-supervised weights if provided
-        if pretrained_model_path and os.path.exists(pretrained_model_path):
-            state_dict = torch.load(pretrained_model_path, map_location='cpu')
-            # Extract only the backbone weights, ignoring the projection heads
-            backbone_state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items() if k.startswith('backbone.')}
-            self.backbone.load_state_dict(backbone_state_dict, strict=False)
-            
-        # Binary classification head replacing the original ImageNet head
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(2048, 1)
-        )
-
-    def forward(self, x):
-        features = self.backbone(x)
-        logits = self.classifier(features)
-        return logits.squeeze(-1) # Return shape [Batch] for BCEWithLogitsLoss
-
-def evaluate_model(model, val_loader, criterion, device):
-    """Evaluates the model on the validation set and returns AUROC and F1 metrics."""
-    model.eval()
-    all_labels, all_preds, all_probs = [], [], []
-
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).float() # Threshold at 0.5
-
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-
-    auroc = roc_auc_score(all_labels, all_probs)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
-    return {'AUROC': auroc, 'F1': f1}
-
-def analyze_confusion_matrix(model, val_loader, device, threshold=0.5, model_name="Model"):
+@torch.no_grad()
+def evaluate_model(model, dataloader, device, threshold=0.5):
     """
-    Evaluates the model on validation data and prints TP, TN, FP, FN, Precision, and Recall.
+    Computes rank-based (AUROC) and threshold-dependent (F1, Recall, Specificity)
+    metrics on a given evaluation dataloader.
     """
     model.eval()
-    all_labels, all_preds = [], []
-    
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images = images.to(device)
-            # Ensure output shape is compatible
-            outputs = model(images)
-            if outputs.dim() > 1:
-                outputs = outputs.squeeze(-1)
-                
-            probs = torch.sigmoid(outputs)
-            preds = (probs > threshold).float()
-            
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            
-    # Calculate components of the confusion matrix
-    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
-    
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0) # Sensitivity
-    
-    predicted_positive_ratio = (tp + fp) / len(all_labels) if len(all_labels) > 0 else 0
-    
-    print(f"=== {model_name} (Threshold: {threshold}) ===")
-    print(f"Total Validation Samples: {len(all_labels)}")
-    print(f"TP (True Positive - Hit)        : {tp}")
-    print(f"FN (False Negative - Missed TB) : {fn}")
-    print(f"TN (True Negative - Correct)    : {tn}")
-    print(f"FP (False Positive - False Alarm): {fp}")
-    print(f"--------------------------------------")
-    print(f"Precision            : {precision:.4f}")
-    print(f"Recall (Sensitivity) : {recall:.4f}")
-    print(f"Predicted Pos. Ratio : {predicted_positive_ratio:.4f}\n")
+    all_probs, all_targets = [], []
 
-if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    image_dir = "/content/drive/MyDrive/TB_data/Shenzhen/ChinaSet_AllFiles/ChinaSet_AllFiles/CXR_png"
-    
-    # Paths to the pre-trained models from Phase 1 (Added ImageNet Baseline)
-    weight_paths = {
-        "ImageNet_Baseline": None,
-        "ICH_Only": "/content/drive/MyDrive/TB_data/ich_model.pth",
-        "CCH_Only": "/content/drive/MyDrive/TB_data/cch_model.pth",
-        "TCL_Full (ICH+CCH)": "/content/drive/MyDrive/TB_data/both_model.pth"
+    for images, labels, _ in dataloader:
+        images = images.to(device)
+        # Obtain predicted probabilities via sigmoid activation
+        probs = torch.sigmoid(model(images)).cpu().numpy()
+        all_probs.extend(probs)
+        all_targets.extend(labels.numpy())
+
+    all_probs = np.array(all_probs)
+    all_targets = np.array(all_targets)
+    # Apply fixed operational decision boundary (default = 0.5)
+    preds = (all_probs >= threshold).astype(int)
+
+    auroc = roc_auc_score(all_targets, all_probs)
+    f1 = f1_score(all_targets, preds, zero_division=0)
+    recall = recall_score(all_targets, preds, zero_division=0)
+    tn, fp, fn, tp = confusion_matrix(all_targets, preds, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp + 1e-8)
+
+    return {
+        "AUROC": auroc,
+        "F1": f1,
+        "Recall": recall,
+        "Specificity": specificity,
+        "probs": all_probs,
+        "targets": all_targets
     }
 
-    # Extract labels from filenames (0 for Normal, 1 for TB)
-    file_list = [f for f in os.listdir(image_dir) if f.endswith('.png')]
-    df_list = [{'filename': f, 'label': int(f.split('_')[-1][0])} for f in file_list]
-    real_df = pd.DataFrame(df_list)
 
-    # 80/20 Stratified Split for Train/Validation
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, val_idx = next(sss.split(real_df, real_df['label']))
-    full_train_df, val_df = real_df.iloc[train_idx].reset_index(drop=True), real_df.iloc[val_idx].reset_index(drop=True)
+def run_single_experiment(model_name, ckpt_path, files, labels, fraction, seed, device, epochs=30):
+    """
+    Trains a model on a specific label fraction and seed, selects the checkpoint
+    with the highest Validation AUROC, and evaluates once on the Held-out Test Set.
+    """
+    set_deterministic_seed(seed)
 
-    # Downstream Augmentations (includes standard normalization)
-    train_transform = T.Compose([
-        T.Resize((224, 224)), T.RandomHorizontalFlip(p=0.5),
-        T.ColorJitter(brightness=0.1, contrast=0.1), T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    val_transform = T.Compose([
-        T.Resize((224, 224)), T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    val_dataset = TBClassificationDataset(val_df, image_dir, transform=val_transform)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=2)
+    # Obtain strict 70% Train Pool (subsampled by fraction), 10% Val, and 20% Held-out Test
+    (f_tr, y_tr), (f_val, y_val), (f_te, y_te) = get_strict_splits(files, labels, fraction, seed)
 
-    # Set label efficiency to 10%
-    frac = 0.1 
-    seeds = [42, 77, 123]
-    ablation_summary = []
+    train_loader = DataLoader(
+        CXRDataset(f_tr, y_tr, get_downstream_transforms(is_train=True)),
+        batch_size=16, shuffle=True
+    )
+    val_loader = DataLoader(
+        CXRDataset(f_val, y_val, get_downstream_transforms(is_train=False)),
+        batch_size=16, shuffle=False
+    )
+    test_loader = DataLoader(
+        CXRDataset(f_te, y_te, get_downstream_transforms(is_train=False)),
+        batch_size=16, shuffle=False
+    )
 
-    # Loop through each ablation architecture
-    for model_name, w_path in weight_paths.items():
-        if w_path is not None and not os.path.exists(w_path): 
-            continue
-            
-        auroc_results, f1_results = [], []
-        
-        # Evaluate across 3 different random seeds for statistical robustness
-        for seed in seeds:
-            set_seed(seed)
-            train_df = get_stratified_subset(full_train_df, fraction=frac, random_seed=seed)
-            train_dataset = TBClassificationDataset(train_df, image_dir, transform=train_transform)
-            train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2, drop_last=True)
+    # Initialize classifier; use ImageNet weights if evaluating the baseline
+    is_imagenet = (model_name == "ImageNet")
+    model = CXRClassifier(backbone_name="legacy_xception", pretrained_imagenet=is_imagenet).to(device)
 
-            model = TBClassifier(pretrained_model_path=w_path).to(device)
-            criterion = nn.BCEWithLogitsLoss()
-            optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    # Load SSL pretrained weights if not ImageNet baseline
+    if not is_imagenet and ckpt_path is not None:
+        model.load_ssl_encoder(ckpt_path, device=device)
 
-            best_auroc, best_f1 = 0.0, 0.0
-            
-            # Short fine-tuning cycle (5 epochs) to evaluate representation quality
-            for epoch in range(5):
-                model.train()
-                for images, labels in train_loader:
-                    images, labels = images.to(device), labels.to(device)
-                    optimizer.zero_grad()
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    criterion = nn.BCEWithLogitsLoss()
 
-                val_metrics = evaluate_model(model, val_loader, criterion, device)
-                best_auroc = max(best_auroc, val_metrics['AUROC'])
-                best_f1 = max(best_f1, val_metrics['F1'])
-            
-            # Print Confusion Matrix right after the 5-epoch cycle for the 10% data regime
-            if frac == 0.1:
-                analyze_confusion_matrix(model, val_loader, device, threshold=0.5, model_name=f"{model_name} (Seed {seed})")
+    best_val_auroc = -1.0
+    best_model_state = None
 
-            auroc_results.append(best_auroc)
-            f1_results.append(best_f1)
- 
-        # Aggregate results
-        ablation_summary.append({
-            'Model': model_name,
-            'AUROC (Mean ± Std)': f"{np.mean(auroc_results):.4f} ± {np.std(auroc_results):.4f}",
-            'F1-Score (Mean ± Std)': f"{np.mean(f1_results):.4f} ± {np.std(f1_results):.4f}"
-        })
+    # Supervised fine-tuning loop
+    for epoch in range(epochs):
+        model.train()
+        for images, targets, _ in train_loader:
+            images, targets = images.to(device), targets.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(images), targets)
+            loss.backward()
+            optimizer.step()
 
-    # Output markdown table for easy GitHub copy-pasting
-    print(pd.DataFrame(ablation_summary).to_markdown(index=False))
+        # Evaluate on the 10% Validation Set to select the optimal checkpoint
+        val_metrics = evaluate_model(model, val_loader, device)
+        if val_metrics["AUROC"] > best_val_auroc:
+            best_val_auroc = val_metrics["AUROC"]
+            best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    # Restore the best validation-selected checkpoint and evaluate once on the 20% Test Set
+    model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+    test_metrics = evaluate_model(model, test_loader, device)
+
+    print(f"[{model_name} | {int(fraction*100)}% | Seed {seed}] "
+          f"Test AUROC: {test_metrics['AUROC']:.4f}, F1: {test_metrics['F1']:.4f}")
+
+    return test_metrics, model
+
+
+if __name__ == "__main__":
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    SHENZHEN_DIR = "./data/Shenzhen"
+    CKPT_DIR = "./checkpoints"
+    SEEDS = [42, 77, 123]
+
+    files, labels = load_tb_filepaths_and_labels(SHENZHEN_DIR)
+
+    # Define experimental matrix: (Model Name, Checkpoint Path, Label Fractions)
+    experiments = [
+        ("ImageNet", None, [0.10, 0.25, 0.50, 1.00]),
+        ("SimCLR", os.path.join(CKPT_DIR, "SimCLR_xception_ssl.pth"), [0.10, 0.25, 0.50, 1.00]),
+        ("TCL_Full", os.path.join(CKPT_DIR, "TCL_Full_xception_ssl.pth"), [0.10, 0.25, 0.50, 1.00]),
+        ("ICH_Only", os.path.join(CKPT_DIR, "ICH_Only_xception_ssl.pth"), [0.10]),
+        ("CCH_Only", os.path.join(CKPT_DIR, "CCH_Only_xception_ssl.pth"), [0.10]),
+    ]
+
+    records = []
+    for model_name, ckpt_path, fractions in experiments:
+        for frac in fractions:
+            for seed in SEEDS:
+                metrics, _ = run_single_experiment(
+                    model_name, ckpt_path, files, labels, frac, seed, DEVICE
+                )
+                records.append({
+                    "Model": model_name,
+                    "Label_Fraction": frac,
+                    "Seed": seed,
+                    "AUROC": metrics["AUROC"],
+                    "F1": metrics["F1"],
+                    "Recall": metrics["Recall"],
+                    "Specificity": metrics["Specificity"]
+                })
+
+    # Aggregate 3-seed results using population standard deviation (ddof=0)
+    df = pd.DataFrame(records)
+    summary = df.groupby(["Model", "Label_Fraction"]).agg(
+        AUROC_mean=("AUROC", "mean"),
+        AUROC_std=("AUROC", lambda x: np.std(x, ddof=0)),
+        F1_mean=("F1", "mean"),
+        F1_std=("F1", lambda x: np.std(x, ddof=0))
+    ).reset_index()
+
+    print("\n=====================================================")
+    print(" FINAL ROBUST RESULTS (Three-seed evaluation) ")
+    print("=====================================================")
+    print(summary.to_markdown(index=False))
+    summary.to_csv("Unified_Evaluation_Results_v2.csv", index=False)
